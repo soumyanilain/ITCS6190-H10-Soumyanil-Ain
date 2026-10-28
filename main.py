@@ -67,8 +67,23 @@ def task1_ingest():
     files stay readable.
     """
     rides = read_rides()
-    # TODO
-    return None
+
+    # Stateless: one new column, nothing to remember between batches
+    parsed = rides.select(
+        "trip_id", "driver_id", "distance_km", "fare_amount",
+        sround(col("fare_amount") / col("distance_km"), 2).alias("fare_per_km"),
+        "event_time",
+    )
+
+    return (parsed.writeStream
+            .format("csv")
+            .option("header", True)
+            .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+            .option("path", out_dir)
+            .option("checkpointLocation", ckpt_dir)
+            .outputMode("append")
+            .trigger(availableNow=True)
+            .start())
 
 
 # ---------------------------------------------------------------- Task 2: windows and watermark
@@ -83,8 +98,35 @@ def task2_fare_per_window(mode):
     option as in task 1.
     """
     rides = read_rides()
-    # TODO
-    return None
+
+    # Watermark on the same column window() uses, and before the groupBy
+    windows = (rides
+               .withWatermark("event_time", "2 minutes")
+               .groupBy(window(col("event_time"), "2 minutes"))
+               .agg(count("*").alias("trips"),
+                    sround(ssum("fare_amount"), 2).alias("total_fare"))
+               .select(col("window.start").alias("window_start"),
+                       col("window.end").alias("window_end"),
+                       "trips", "total_fare"))
+
+    writer = (windows.writeStream
+              .outputMode(mode)
+              .option("checkpointLocation", ckpt_dir)
+              .trigger(availableNow=True))
+
+    if mode == "append":
+        # A window is written once, when the watermark passes its end
+        writer = (writer.format("csv")
+                  .option("header", True)
+                  .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+                  .option("path", out_dir))
+    else:
+        # Update mode: every window that changed in a batch is printed again
+        writer = (writer.format("console")
+                  .option("truncate", False)
+                  .option("numRows", 50))
+
+    return writer.start()
 
 
 # ---------------------------------------------------------------- main
